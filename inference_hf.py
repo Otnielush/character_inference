@@ -13,6 +13,8 @@ import numpy as np
 
 from multiprocessing import set_start_method, Queue, Process, Pipe, current_process
 
+from torch import memory_format
+
 try:
     set_start_method('spawn')
 except RuntimeError:
@@ -188,6 +190,9 @@ def gpu_worker(gpu_id: int, world_size, task_queue, args):
     from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig
     from diffusers import FluxTransformer2DModel, FluxPipeline, AutoencoderKL
 
+    from para_attn.parallel_vae.diffusers_adapters import parallelize_vae
+    from para_attn.first_block_cache.diffusers_adapters import apply_cache_on_transformer
+
     change_globals(args, max_mem=True)
     print(f"GPU {gpu_id} globals: {OFFLOAD_EMBD = }  {OFFLOAD_VAE = }")
 
@@ -215,19 +220,23 @@ def gpu_worker(gpu_id: int, world_size, task_queue, args):
     model = FluxPipeline.from_pretrained("black-forest-labs/flux.1-dev", transformer=transformer, text_encoder=None,
                                          text_encoder_2=None, tokenizer=None, tokenizer_2=None, vae=None,
                                          torch_dtype=dtype).to("cuda")
+    apply_cache_on_transformer(model, residual_diff_threshold=0.12)
+    model.to(memory_format=torch.channels_last)
 
     vae = AutoencoderKL.from_pretrained("black-forest-labs/flux.1-dev", subfolder="vae",
                                         torch_dtype=dtype, max_memory=max_memory)
+    parallelize_vae(vae)
+    vae.to(memory_format=torch.channels_last)
+
     if OFFLOAD_VAE:
         vae.to('cpu')
     else:
         vae.to('cuda')
 
-    # warmup and compile
-    print(f"GPU {gpu_id} warmup.")
-    warmup_dict = dict(height=1024, width=1024, num_steps=4, guidance=3.5, seed=10,
-        prompt="A beautiful Warmup image generation used nn.Linear input scales prior to compilation 😉",)
-    process_data_on_gpu(encoder, model, vae, gpu_id, warmup_dict, None)
+    # compile
+    # torch.compile configuration
+    config = torch._inductor.config
+    config.conv_1x1_as_mm = True
     # with torch.inference_mode():
         # for block in model.transformer.transformer_blocks:
         #     block.compile()
@@ -238,8 +247,14 @@ def gpu_worker(gpu_id: int, world_size, task_queue, args):
         #     getattr(model.transformer, extra).compile()
         # encoder.text_encoder_2.compile()
         # encoder.text_encoder.compile()
-        # vae.fuse_qkv_projections()
-        # vae = torch.compile(vae)
+    vae.fuse_qkv_projections()
+    vae = torch.compile(vae)
+
+    # warmup
+    print(f"GPU {gpu_id} warmup.")
+    warmup_dict = dict(height=1024, width=1024, num_steps=4, guidance=3.5, seed=10,
+        prompt="A beautiful Warmup image generation used nn.Linear input scales prior to compilation 😉",)
+    process_data_on_gpu(encoder, model, vae, gpu_id, warmup_dict, None)
 
 
     # generation loop

@@ -27,3 +27,4 @@ diffusers
 protobuf
 peft
 triton
+para-attn
