@@ -13,7 +13,6 @@ import numpy as np
 
 from multiprocessing import set_start_method, Queue, Process, Pipe, current_process
 
-from torch import memory_format
 
 try:
     set_start_method('spawn')
@@ -79,9 +78,6 @@ def parse_args():
     # parser.add_argument("-c", "--config-path", type=str, help="Path to the configuration file, if not provided, the model will be loaded from the command line arguments")
     parser.add_argument("-p", "--port", type=int, default=8088, help="Port to run the server on")
     parser.add_argument("-H", "--host", type=str, default="0.0.0.0", help="Host to run the server on")
-    parser.add_argument("--no_offload_embd", action="store_true", help="Keep embedding model always on GPU")
-    parser.add_argument("--no_offload_vae", action="store_true", help="Keep VAE model always on GPU")
-    parser.add_argument("--no_quant", action="store_true", help="Do not quantize Flux model")
 
     return parser.parse_args()
 
@@ -91,14 +87,11 @@ def process_data_on_gpu(encoder, model, vae, device, vars: dict[str, Any], pipe_
     # encoder
     print(f"GPU {device} encoder: {vars['prompt'][:40]}")
 
-    if OFFLOAD_EMBD:
-        encoder.to("cuda")
     with torch.inference_mode():
         prompt_embeds, pooled_prompt_embeds, text_ids = encoder.encode_prompt(
             vars['prompt'], prompt_2=None, max_sequence_length=512, num_images_per_prompt=1)
-    if OFFLOAD_EMBD:
-        encoder.to('cpu')
-        flush()
+
+    flush()
 
     # loading loras
     print(f"GPU {device} loading loras")
@@ -147,15 +140,11 @@ def process_data_on_gpu(encoder, model, vae, device, vars: dict[str, Any], pipe_
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
 
-    if OFFLOAD_VAE:
-        vae.to("cuda")
     with torch.inference_mode():
         latents = FluxPipeline._unpack_latents(latents, vars['height'], vars['width'], vae_scale_factor)
         latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
         image = vae.decode(latents, return_dict=False)[0]
         image = image_processor.postprocess(image, output_type="pil")[0]
-    if OFFLOAD_VAE:
-        vae.to('cpu')
 
     if pipe_in is None: # warmup
         return
@@ -166,7 +155,6 @@ def process_data_on_gpu(encoder, model, vae, device, vars: dict[str, Any], pipe_
     imgByteArr = imgByteArr.getvalue()
     pipe_in.send(imgByteArr)
     pipe_in.send(None)  # Signal completion
-
 
 
 
@@ -187,51 +175,42 @@ def gpu_worker(gpu_id: int, world_size, task_queue, args):
     torch.set_float32_matmul_precision("high")
 
 
-    from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig
     from diffusers import FluxTransformer2DModel, FluxPipeline, AutoencoderKL
 
-    from para_attn.parallel_vae.diffusers_adapters import parallelize_vae
-    from para_attn.first_block_cache.diffusers_adapters import apply_cache_on_transformer
 
-    change_globals(args, max_mem=True)
-    print(f"GPU {gpu_id} globals: {OFFLOAD_EMBD = }  {OFFLOAD_VAE = }")
+    from para_attn.first_block_cache.diffusers_adapters import apply_cache_on_pipe
+
+    change_globals(max_mem=True)
+    # print(f"GPU {gpu_id} globals: {OFFLOAD_EMBD = }  {OFFLOAD_VAE = }")
 
     max_memory = {k: "0GB" for k in range(world_size)}
     max_memory[gpu_id] = str(MAX_GPU_MEMORY) + "GB"
     max_memory["cpu"] = "0GB"
 
     print(f"GPU {gpu_id} loading model. {max_memory = }")
-    dtype = torch.float16 if not args.no_quant else torch.bfloat16
+    dtype = torch.bfloat16
 
     # start model on GPU
     encoder = FluxPipeline.from_pretrained("black-forest-labs/flux.1-dev", transformer=None, vae=None,
                                            torch_dtype=dtype, max_memory=max_memory)
-
-    if OFFLOAD_EMBD:
-        encoder.to('cpu')
-    else:
-        encoder.to('cuda')
+    encoder.to('cuda')
 
     transformer = FluxTransformer2DModel.from_pretrained("black-forest-labs/flux.1-dev", subfolder="transformer",
                 max_memory=max_memory,
-                quantization_config=DiffusersBitsAndBytesConfig(load_in_8bit=True) if not args.no_quant else None,
+                quantization_config=None,
                 torch_dtype=dtype,)
 
     model = FluxPipeline.from_pretrained("black-forest-labs/flux.1-dev", transformer=transformer, text_encoder=None,
                                          text_encoder_2=None, tokenizer=None, tokenizer_2=None, vae=None,
                                          torch_dtype=dtype).to("cuda")
-    apply_cache_on_transformer(model, residual_diff_threshold=0.12)
+
+    apply_cache_on_pipe(model, residual_diff_threshold=0.12)
     model.to(memory_format=torch.channels_last)
 
     vae = AutoencoderKL.from_pretrained("black-forest-labs/flux.1-dev", subfolder="vae",
                                         torch_dtype=dtype, max_memory=max_memory)
-    parallelize_vae(vae)
+    vae.to('cuda')
     vae.to(memory_format=torch.channels_last)
-
-    if OFFLOAD_VAE:
-        vae.to('cpu')
-    else:
-        vae.to('cuda')
 
     # compile
     # torch.compile configuration
@@ -247,6 +226,7 @@ def gpu_worker(gpu_id: int, world_size, task_queue, args):
         #     getattr(model.transformer, extra).compile()
         # encoder.text_encoder_2.compile()
         # encoder.text_encoder.compile()
+    transformer.fuse_qkv_projections()
     vae.fuse_qkv_projections()
     vae = torch.compile(vae)
 
@@ -346,14 +326,7 @@ async def generate(args: GenerateArgs):
     return StreamingResponse(output_generator(pipe_out), media_type="image/jpeg")
 
 
-def change_globals(args, num_gpus=False, max_mem=False):
-    global OFFLOAD_EMBD, OFFLOAD_VAE
-    if args.no_offload_embd:
-        OFFLOAD_EMBD = False
-        # print("OFFLOAD_EMBD changed to False")
-    if args.no_offload_vae:
-        OFFLOAD_VAE = False
-        # print("OFFLOAD_VAE changed to False")
+def change_globals(num_gpus=False, max_mem=False):
     if num_gpus:
         global NUM_GPUS
         NUM_GPUS = torch.cuda.device_count()
@@ -382,12 +355,12 @@ app.add_event_handler("shutdown", shutdown_gpus)
 if __name__ == "__main__":
 
     args = parse_args()
-    max_gpu_memory = int(torch.cuda.mem_get_info(0)[1] / 1024 ** 2 / 1000)
-    if max_gpu_memory > 37:
-        args.no_offload_embd = True
-        args.no_offload_vae = True
-    change_globals(args, True, True)
-    print(f"\nMain globals:\n\t{NUM_GPUS = }\n\t{MAX_GPU_MEMORY = }\n\t{OFFLOAD_EMBD = }\n\t{OFFLOAD_VAE = }\n")
+    # max_gpu_memory = int(torch.cuda.mem_get_info(0)[1] / 1024 ** 2 / 1000)
+    # if max_gpu_memory > 37:
+    #     args.no_offload_embd = True
+    #     args.no_offload_vae = True
+    change_globals(True, True)
+    print(f"\nMain globals:\n\t{NUM_GPUS = }\n\t{MAX_GPU_MEMORY = }\n")
 
     os.makedirs(STYLES_FOLDER, exist_ok=True)
 
